@@ -232,6 +232,20 @@ def update_feed(storage, feed, entry):
     )
 
 
+def update_feed_guarded(storage, feed, entry):
+    # the feed was just added to a fresh database, so its generation is 1
+    storage.update_feed_guarded(
+        FeedUpdateIntent(
+            feed.url,
+            datetime(2010, 1, 1),
+            datetime(2010, 1, 1),
+            FeedToUpdate(feed, entry.updated),
+        ),
+        [],
+        1,
+    )
+
+
 def add_or_update_entry(storage, feed, entry):
     storage.add_or_update_entry(
         EntryUpdateIntent(
@@ -316,6 +330,7 @@ def get_entry_counts(storage, _, __):
         get_entry_recent_sort,
         set_entry_recent_sort,
         update_feed,
+        update_feed_guarded,
         add_or_update_entry,
         add_or_update_entries,
         add_entry,

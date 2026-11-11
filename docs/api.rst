@@ -131,6 +131,10 @@ The class hierarchy for :mod:`reader` exceptions is:
     :show-inheritance:
     :members:
 
+.. autoexception:: ConcurrentUpdateError
+    :show-inheritance:
+    :members:
+
 .. autoexception:: ParseError
     :show-inheritance:
     :members:

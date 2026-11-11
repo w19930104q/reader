@@ -92,6 +92,54 @@ or if the thread was not created through the :mod:`threading` module
 when garbage-collected).
 
 
+.. _concurrent-updates:
+
+Concurrent updates
+~~~~~~~~~~~~~~~~~~
+
+By default, updating the same feed more than once at the same time
+(from multiple threads or processes) is *last writer wins*:
+whichever update finishes last overwrites the feed state,
+even if it started from an older state.
+
+Pass ``concurrent_updates=True`` to :func:`make_reader`
+to protect against this::
+
+    reader = make_reader('db.sqlite', concurrent_updates=True)
+
+When enabled, each update takes the feed state it read as its starting
+point, and only the first update for a given state is committed.
+A slower update that finishes afterwards is discarded –
+it writes no entries, validators, scheduling information or errors –
+and is reported as :exc:`.ConcurrentUpdateError`:
+
+* :meth:`~Reader.update_feed` raises it;
+* :meth:`~Reader.update_feeds_iter` yields it as the feed's value;
+* :meth:`~Reader.update_feeds` emits it as a warning
+  and continues with the other feeds.
+
+The update is *not* retried automatically;
+retrying it yourself is safe,
+and simply fetches and commits against the current state.
+
+Protection also covers feeds being deleted and re-added at the same URL,
+and feeds whose URL is changed away and then changed back:
+an update still in flight for the old feed can never be written
+to the new one. HTTP 200 (updated), 304 (not modified)
+and retrieval/parse failures are all handled the same way.
+
+The accepted entries are committed together with the feed state;
+if any write fails, the whole update is rolled back.
+After-update hooks run only after a successful commit,
+and errors from them do not roll the commit back.
+
+Waiting for the network does not hold the SQLite write lock,
+so other readers and writers are not blocked while a feed is fetched.
+
+The flag defaults to :const:`False`;
+readers created without it keep the legacy last-writer-wins behavior.
+
+
 .. _temp:
 
 Temporary databases

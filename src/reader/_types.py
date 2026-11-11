@@ -307,6 +307,11 @@ class FeedForUpdate(NamedTuple):
     #: The :attr:`~FeedData.hash` of the corresponding FeedData.
     hash: bytes | None = None
 
+    #: The feed's update generation at the time the update started.
+    #: Used for concurrent update protection; None when unavailable
+    #: (e.g. the object was not created by the storage).
+    update_generation: int | None = None
+
 
 class EntryForUpdate(NamedTuple):
     """Update-relevant information about an existing entry, from Storage."""
@@ -1033,6 +1038,30 @@ class StorageType(Protocol):
             intent
 
         Raises:
+            FeedNotFoundError
+
+        """
+
+    def update_feed_guarded(
+        self,
+        intent: FeedUpdateIntent,
+        entries: Iterable[EntryUpdateIntent],
+        expected_generation: int,
+        /,
+    ) -> None:
+        """Called by update logic when concurrent update protection is on.
+
+        Atomically write the entries and the feed state,
+        but only if the feed's update generation
+        still matches ``expected_generation``.
+
+        Args:
+            intent
+            entries
+            expected_generation
+
+        Raises:
+            ConcurrentUpdateError: The generation no longer matches.
             FeedNotFoundError
 
         """

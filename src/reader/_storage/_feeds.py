@@ -11,12 +11,14 @@ from typing import cast
 from typing import NewType
 from typing import TYPE_CHECKING
 
+from .._types import EntryUpdateIntent
 from .._types import FeedFilter
 from .._types import FeedForUpdate
 from .._types import FeedToUpdate
 from .._types import FeedUpdateIntent
 from .._utils import exactly_one
 from .._utils import zero_or_one
+from ..exceptions import ConcurrentUpdateError
 from ..exceptions import FeedExistsError
 from ..exceptions import FeedNotFoundError
 from ..types import Author
@@ -41,15 +43,44 @@ else:
 
 FeedDict = NewType('FeedDict', Mapping[str, SQLiteValue])
 
+#: Key in the ``meta`` table holding the next generation value.
+NEXT_UPDATE_GENERATION_KEY = 'next_update_generation'
+
 
 class FeedsMixin(StorageBase):
+    def _next_update_generation(self, db: sqlite3.Connection) -> int:
+        """Return a generation value that was never used by any feed row.
+
+        Must be called inside a write transaction.
+
+        """
+        # No RETURNING (added in SQLite 3.35; we support 3.18+).
+        (generation,) = exactly_one(
+            db.execute(
+                "SELECT value FROM meta WHERE key = :key;",
+                dict(key=NEXT_UPDATE_GENERATION_KEY),
+            )
+        )
+        assert isinstance(generation, int)
+        db.execute(
+            "UPDATE meta SET value = :value WHERE key = :key;",
+            dict(value=generation + 1, key=NEXT_UPDATE_GENERATION_KEY),
+        )
+        return generation
+
     @wrap_exceptions()
     def add_feed(self, url: str, added: datetime) -> None:
         with self.get_db() as db:
             try:
+                generation = self._next_update_generation(db)
                 db.execute(
-                    "INSERT INTO feeds (url, added) VALUES (:url, :added);",
-                    dict(url=url, added=adapt_datetime(added)),
+                    "INSERT INTO feeds (url, added, update_generation) "
+                    "VALUES (:url, :added, :update_generation);",
+                    dict(
+                        url=url,
+                        added=adapt_datetime(added),
+                        update_generation=generation,
+                    ),
                 )
             except sqlite3.IntegrityError as e:
                 e_msg = str(e).lower()
@@ -61,7 +92,10 @@ class FeedsMixin(StorageBase):
     def delete_feed(self, url: str) -> None:
         with self.get_db() as db:
             cursor = db.execute("DELETE FROM feeds WHERE url = :url;", dict(url=url))
-        rowcount_exactly_one(cursor, lambda: FeedNotFoundError(url))
+            rowcount_exactly_one(cursor, lambda: FeedNotFoundError(url))
+            # The URL may be added back later; the deleted generation must
+            # never be reused, so in-flight results stay discarded.
+            self._next_update_generation(db)
 
     @wrap_exceptions()
     def change_feed_url(self, old: str, new: str) -> None:
@@ -78,6 +112,14 @@ class FeedsMixin(StorageBase):
                 raise  # pragma: no cover
             else:
                 rowcount_exactly_one(cursor, lambda: FeedNotFoundError(old))
+
+            # Invalidate any update still in flight for either the old or
+            # the new URL (including change-away-and-back scenarios).
+            generation = self._next_update_generation(db)
+            db.execute(
+                "UPDATE feeds SET update_generation = :generation WHERE url = :url;",
+                dict(generation=generation, url=new),
+            )
 
             # Some of the fields are not kept from the old feed; details:
             # https://github.com/lemon24/reader/issues/149#issuecomment-700532183
@@ -190,6 +232,7 @@ class FeedsMixin(StorageBase):
                 last_updated,
                 last_exception,
                 data_hash,
+                update_generation,
             ) = row
             return FeedForUpdate(
                 url,
@@ -199,6 +242,7 @@ class FeedsMixin(StorageBase):
                 convert_timestamp(last_updated) if last_updated else None,
                 last_exception == 1,
                 data_hash,
+                update_generation,
             )
 
         def make_query() -> tuple[Query, dict[str, Any]]:
@@ -212,6 +256,7 @@ class FeedsMixin(StorageBase):
                     'last_updated',
                     ('last_exception', 'last_exception IS NOT NULL'),
                     'data_hash',
+                    'update_generation',
                 )
                 .FROM("feeds")
                 .scrolling_window_order_by("url")
@@ -232,6 +277,80 @@ class FeedsMixin(StorageBase):
 
     def update_feed(self, intent: FeedUpdateIntent) -> None:
         return self.update_feed_dict(feed_update_intent_to_dict(intent))
+
+    @wrap_exceptions()
+    def update_feed_guarded(
+        self,
+        intent: FeedUpdateIntent,
+        entries: Iterable[EntryUpdateIntent],
+        expected_generation: int,
+        /,
+    ) -> None:
+        """Atomically write feed state and entries, only if the feed's
+        update generation still matches ``expected_generation``.
+
+        If another commit changed the generation in the meantime
+        (a parallel update won, the feed was deleted and re-added,
+        or its URL changed), nothing is written and
+        :exc:`ConcurrentUpdateError` is raised.
+
+        Either all the writes (feed state, entries) are committed
+        together, or none are.
+
+        """
+        from ._entries import entry_update_intent_to_dict
+
+        feed_dict = feed_update_intent_to_dict(intent)
+        url = intent.url
+        expressions = [f"{name} = :{name}" for name in feed_dict if name != 'url']
+        query = (
+            f"UPDATE feeds SET {', '.join(expressions)} "
+            "WHERE url = :url AND update_generation = :expected_generation;"
+        )
+        context = dict(feed_dict)
+        context['expected_generation'] = expected_generation
+
+        try:
+            # One connection/context for the whole commit.
+            # The sqlite3 module opens a transaction on the first DML
+            # and the context manager commits on success / rolls back
+            # on any exception, so feed state and entries are atomic.
+            with self.get_db() as db:
+                # CAS first: a zero rowcount means we must not write
+                # anything, so raise while still inside the transaction.
+                cursor = db.execute(query, context)
+
+                if cursor.rowcount == 0:
+                    exists = db.execute(
+                        "SELECT 1 FROM feeds WHERE url = :url;", dict(url=url)
+                    ).fetchone()
+                    if not exists:
+                        raise FeedNotFoundError(url)
+                    raise ConcurrentUpdateError(url)
+
+                assert cursor.rowcount == 1, "shouldn't update more than 1 row"
+
+                for entry_dict in map(entry_update_intent_to_dict, entries):
+                    new = not list(
+                        db.execute(
+                            "SELECT 1 FROM entries WHERE (feed, id) = (?, ?)",
+                            (entry_dict['feed'], entry_dict['id']),
+                        )
+                    )
+                    if new:
+                        # provided by EntriesMixin on the combined Storage
+                        self._insert_entry_dict(  # type: ignore[attr-defined]
+                            db, entry_dict
+                        )
+                    else:
+                        self._update_entry_dict(  # type: ignore[attr-defined]
+                            db, entry_dict
+                        )
+        except sqlite3.IntegrityError as e:
+            e_msg = str(e).lower()
+            if "foreign key constraint failed" in e_msg:
+                raise FeedNotFoundError(url) from None
+            raise  # pragma: no cover
 
     @wrap_exceptions()
     def update_feed_dict(self, intent: FeedDict) -> None:

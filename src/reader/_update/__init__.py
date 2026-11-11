@@ -406,11 +406,20 @@ class Pipeline(PipelineBase[FeedData, EntryData, FeedUpdateIntent, EntryUpdateIn
         )
 
     def store_feed(
-        self, feed: FeedUpdateIntent, entries: Iterable[EntryUpdateIntent]
+        self,
+        feed: FeedUpdateIntent,
+        entries: Iterable[EntryUpdateIntent],
+        generation: int | None = None,
     ) -> None:
-        if entries:
-            self.reader._storage.add_or_update_entries(entries)
-        self.reader._storage.update_feed(feed)
+        if self.concurrent_updates:
+            assert generation is not None, "missing update generation"
+            # Entries and feed state commit together, or not at all;
+            # a generation mismatch discards this (late) result.
+            self.reader._storage.update_feed_guarded(feed, entries, generation)
+        else:
+            if entries:
+                self.reader._storage.add_or_update_entries(entries)
+            self.reader._storage.update_feed(feed)
 
     def get_entry_resource_id(self, data: EntryData) -> tuple[str, str]:
         return data.resource_id

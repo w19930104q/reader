@@ -697,13 +697,18 @@ def test_change_feed_url_feeds_for_update(reader):
     reader.change_feed_url('1', '3')
 
     assert not get_feed('1')
-    assert get_feed('3') == old_one._replace(
+    new_three = get_feed('3')
+    # changing the URL bumps the update generation,
+    # so in-flight updates for either URL are discarded
+    assert new_three.update_generation > old_one.update_generation
+    assert new_three == old_one._replace(
         url='3',
         updated=None,
         caching_info=None,
         last_updated=None,
         last_exception=False,
         stale=False,
+        update_generation=new_three.update_generation,
     )
 
 

@@ -200,6 +200,36 @@ class UpdateError(ReaderError):
     """
 
 
+class ConcurrentUpdateError(UpdateError, ReaderWarning):
+    """An update result was discarded because a newer update of the same
+    feed was committed first.
+
+    Raised (or yielded) only when concurrent update protection is enabled
+    (``concurrent_updates=True`` on :func:`.make_reader`);
+    the feed is not modified and the update can safely be retried.
+
+    .. versionadded:: 3.28
+
+    """
+
+    _default_message = "discarded stale concurrent update"
+
+    def __init__(self, url: str, /, message: str = '') -> None:
+        super().__init__(message)
+
+        #: The feed URL.
+        self.url = url
+
+    @property
+    def _str(self) -> str:
+        return repr(self.url)
+
+    @property
+    def resource_id(self) -> tuple[str]:
+        """Alias for (:attr:`~url`,)."""
+        return (self.url,)
+
+
 class ParseError(UpdateError, FeedError, ReaderWarning):
     """An error occurred while retrieving/parsing the feed.
 

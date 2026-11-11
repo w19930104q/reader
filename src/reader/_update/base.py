@@ -35,7 +35,7 @@ logger = get_logger('reader.update')
 
 
 type PipelineFactory = Callable[
-    [Reader, datetime, int, bool], PipelineBase[Any, Any, Any, Any]
+    [Reader, datetime, int, bool, bool], PipelineBase[Any, Any, Any, Any]
 ]
 type ParseResult[FD, ED] = ParseResultBase[FeedForUpdate, FD, ED, ParseError]
 type EntryPair[ED] = EntryPairBase[ED]
@@ -54,6 +54,7 @@ class PipelineBase[FD, ED, FI, EI](ABC):
     now: datetime
     workers: int
     call_feeds_hooks: bool
+    concurrent_updates: bool = False
 
     @abstractmethod
     def parse_feeds(
@@ -74,6 +75,7 @@ class PipelineBase[FD, ED, FI, EI](ABC):
         self,
         feed: FI,
         entries: Iterable[EI],
+        generation: int | None = None,
     ) -> None:
         """Save the update intents to storage."""
 
@@ -141,8 +143,14 @@ class PipelineBase[FD, ED, FI, EI](ABC):
                 feed_intent, entry_intents = self.make_intents(result, entry_pairs)
                 entry_intents = list(entry_intents)
 
-                with self.run_feed_hooks(feed.url, entry_intents, result.metadata):
-                    self.store_feed(feed_intent, [new for new, _ in entry_intents])
+                with self.run_feed_hooks(
+                    feed.url, entry_intents, result.metadata
+                ):
+                    self.store_feed(
+                        feed_intent,
+                        [new for new, _ in entry_intents],
+                        feed.update_generation,
+                    )
 
         except Exception as e:
             return feed.url, e

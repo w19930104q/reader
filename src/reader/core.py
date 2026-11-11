@@ -33,6 +33,7 @@ from ._update.hooks import HookErrorGrouper
 from ._update.hooks import Hooks
 from ._utils import eager_iterable
 from ._utils import zero_or_one
+from .exceptions import ConcurrentUpdateError
 from .exceptions import EntryNotFoundError
 from .exceptions import FeedError
 from .exceptions import FeedExistsError
@@ -102,6 +103,7 @@ def make_reader(
     session_timeout: TimeoutType = DEFAULT_TIMEOUT,
     reserved_name_scheme: Mapping[str, str] = DEFAULT_RESERVED_NAME_SCHEME,
     search_enabled: bool | None | Literal['auto'] = 'auto',
+    concurrent_updates: bool = False,
     _storage: StorageType | None = None,
 ) -> Reader:
     """Create a new :class:`Reader`.
@@ -194,6 +196,15 @@ def make_reader(
             :const:`False` (disable),
             :const:`None` (do nothing).
 
+        concurrent_updates (bool):
+            Protect feed updates from concurrent writers.
+            When enabled, an update only commits if the feed did not change
+            since it was read for the update; a late result (from a slow
+            fetch, a deleted-and-readded feed, or a feed whose URL changed
+            and changed back) is discarded instead of overwriting the newer
+            state, and reported as :exc:`.ConcurrentUpdateError`.
+            Defaults to :const:`False` (last writer wins, legacy behavior).
+
     .. _Requests session: https://requests.readthedocs.io/en/master/user/advanced/#timeouts
 
     Returns:
@@ -251,6 +262,9 @@ def make_reader(
     .. versionadded:: 3.27
         The ``migrate`` keyword argument.
 
+    .. versionadded:: 3.28
+        The ``concurrent_updates`` keyword argument.
+
     """
 
     # Do as much work as possible before creating the storage.
@@ -298,6 +312,7 @@ def make_reader(
             parser,
             name_scheme,
             _enable_search=(search_enabled == 'auto'),
+            _concurrent_updates=concurrent_updates,
             _called_directly=False,
         )
 
@@ -374,6 +389,7 @@ class Reader:
         _parser: Parser,
         _reserved_name_scheme: NameScheme,
         _enable_search: bool = False,
+        _concurrent_updates: bool = False,
         _called_directly: bool = True,
     ):
         #: The :class:`~reader._types.StorageType` instance used by this reader.
@@ -385,6 +401,8 @@ class Reader:
 
         self._reserved_name_scheme = _reserved_name_scheme
         self._enable_search = _enable_search
+        #: Whether concurrent update protection is enabled.
+        self._concurrent_updates = _concurrent_updates
         self._make_pipeline: PipelineFactory = Pipeline
 
         # TODO: make Hooks subclass list and get rid of the properties (?)
@@ -807,6 +825,11 @@ class Reader:
 
         Silently skip feeds that raise :exc:`ParseError`.
 
+        If concurrent update protection is enabled
+        (see :func:`make_reader`'s ``concurrent_updates`` argument),
+        feeds that lose an update race emit a :exc:`ConcurrentUpdateError`
+        warning and are skipped; the other feeds are still updated.
+
         Re-raise :attr:`before_feeds_update_hooks` failures immediately.
         Collect all other update hook failures
         and re-raise them as an :exc:`UpdateHookErrorGroup`;
@@ -901,6 +924,12 @@ class Reader:
                 if isinstance(value, ParseError):
                     continue
 
+                if isinstance(value, ConcurrentUpdateError):
+                    # A newer update of this feed won; don't retry,
+                    # don't fail the whole batch, just warn and continue.
+                    warnings.warn(value, stacklevel=2)
+                    continue
+
                 if isinstance(value, UpdateHookError):
                     grouper.add(value, url, limit=5)
                     continue
@@ -960,6 +989,8 @@ class Reader:
                 Currently, the exception can be:
 
                 * :exc:`ParseError`, if retrieving/parsing the feed failed
+                * :exc:`ConcurrentUpdateError`, if concurrent update
+                  protection is enabled and a newer update won the race
                 * :exc:`UpdateHookError`, for unexpected hook exceptions
                   raised in :attr:`before_feed_update_hooks`,
                   :attr:`after_entry_update_hooks`, or
@@ -1022,7 +1053,13 @@ class Reader:
             now, feed, tags, broken, updates_enabled, new, scheduled
         )
 
-        pipeline = self._make_pipeline(self, now, workers, _call_feeds_hooks)
+        pipeline = self._make_pipeline(
+            self,
+            now,
+            workers,
+            _call_feeds_hooks,
+            self._concurrent_updates,
+        )
         yield from pipeline.update(filter)
 
     def update_feed(self, feed: FeedInput, /) -> UpdatedFeed | None:

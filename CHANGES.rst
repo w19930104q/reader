@@ -11,6 +11,24 @@ Version 3.28
 
 Unreleased
 
+* Add opt-in protection against concurrent updates of the same feed,
+  enabled with the ``concurrent_updates`` :func:`make_reader` argument.
+
+  * When enabled, an update only commits if the feed did not change
+    since it was read for the update; a late result (a slow fetch,
+    a deleted-and-readded feed, or a feed whose URL changed and
+    changed back) is discarded instead of overwriting the newer state,
+    and reported as :exc:`ConcurrentUpdateError`
+    (raised by :meth:`~Reader.update_feed`,
+    yielded by :meth:`~Reader.update_feeds_iter`,
+    warned about by :meth:`~Reader.update_feeds`).
+    The update is not retried automatically.
+  * Entries and feed state are committed atomically;
+    any write failure rolls the whole update back.
+    After-update hooks run only after a successful commit.
+  * The default (last writer wins) behavior is unchanged.
+    Existing databases are migrated automatically.
+
 
 Version 3.27
 ------------

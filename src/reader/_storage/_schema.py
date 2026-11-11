@@ -28,10 +28,21 @@ CREATE TABLE feeds (
     last_retrieved TIMESTAMP,  -- null if the feed was never retrieved
     last_updated TIMESTAMP,  -- null if the feed was never updated
     added TIMESTAMP NOT NULL,
-    last_exception TEXT
+    last_exception TEXT,
+
+    -- changed every time the feed is added, deleted-and-readded,
+    -- or its URL changes; used by concurrent update protection (CAS)
+    update_generation INTEGER NOT NULL DEFAULT 1
 
     -- NOTE: when adding new fields, check if they should be set
     -- to their default value in change_feed_url()
+);
+
+
+-- Key-value table for storage-wide counters and metadata.
+CREATE TABLE meta (
+    key TEXT PRIMARY KEY NOT NULL,
+    value INTEGER NOT NULL
 );
 
 
@@ -128,6 +139,7 @@ entries_table = SCHEMA['table']['entries']
 global_tags_table = SCHEMA['table']['global_tags']
 feed_tags_table = SCHEMA['table']['feed_tags']
 entry_tags_table = SCHEMA['table']['entry_tags']
+meta_table = SCHEMA['table']['meta']
 
 entries_by_recent_index = SCHEMA['index']['entries_by_recent']
 entries_by_feed_index = SCHEMA['index']['entries_by_feed']
@@ -141,6 +153,12 @@ def create_all(db: sqlite3.Connection) -> None:
     global_tags_table.create(db)
     feed_tags_table.create(db)
     entry_tags_table.create(db)
+    meta_table.create(db)
+    # New feeds get their generation from the counter, starting at 1.
+    # Keep in sync with FeedsMixin.NEXT_UPDATE_GENERATION_KEY.
+    db.execute(
+        "INSERT INTO meta (key, value) VALUES ('next_update_generation', 1);"
+    )
     create_indexes(db)
 
 
@@ -362,7 +380,24 @@ def update_from_43_to_44(db: sqlite3.Connection, /) -> None:  # pragma: no cover
     """)
 
 
-VERSION = 44
+def update_from_44_to_45(db: sqlite3.Connection, /) -> None:
+    # Concurrent update protection; the column and the meta table
+    # are used by Storage.update_feed_guarded().
+    db.execute(
+        "ALTER TABLE feeds ADD COLUMN update_generation INTEGER NOT NULL DEFAULT 1;"
+    )
+    meta_table.create(db)
+    # continue numbering generations above any existing feed's generation
+    (max_generation,) = db.execute(
+        "SELECT coalesce(max(update_generation), 0) FROM feeds;"
+    ).fetchone()
+    db.execute(
+        "INSERT INTO meta (key, value) VALUES ('next_update_generation', ?);",
+        (max_generation + 1,),
+    )
+
+
+VERSION = 45
 
 MIGRATIONS = {
     # 1-9 removed before 0.1 (last in e4769d8ba77c61ec1fe2fbe99839e1826c17ace7)
@@ -377,6 +412,7 @@ MIGRATIONS = {
     41: update_from_41_to_42,
     42: update_from_42_to_43,
     43: update_from_43_to_44,
+    44: update_from_44_to_45,
 }
 MISSING_SUFFIX = (
     "; you may have skipped some required migrations, see "

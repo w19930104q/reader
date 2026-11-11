@@ -80,6 +80,7 @@ from .exceptions import (
     EntryExistsError as EntryExistsError,
     EntryNotFoundError as EntryNotFoundError,
     UpdateError as UpdateError,
+    ConcurrentUpdateError as ConcurrentUpdateError,
     ParseError as ParseError,
     UpdateHookError as UpdateHookError,
     SingleUpdateHookError as SingleUpdateHookError,
